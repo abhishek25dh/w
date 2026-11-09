@@ -5,74 +5,42 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.graphics.Canvas;
 import android.graphics.Color;
-import android.graphics.Paint;
-import android.graphics.RadialGradient;
-import android.graphics.Rect;
-import android.graphics.Shader;
+import android.media.MediaPlayer;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.service.wallpaper.WallpaperService;
 import android.view.SurfaceHolder;
+import java.io.IOException;
 
 public class TestWallpaper extends WallpaperService {
-    @Override public Engine onCreateEngine() { return new Renderer(); }
-    final class Renderer extends Engine {
-        private final Handler handler = new Handler(Looper.getMainLooper());
-        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final KeyguardManager keyguard = (KeyguardManager)getSystemService(Context.KEYGUARD_SERVICE);
-        private final Runnable drawTask = this::draw;
-        private boolean visible, registered, needsWake = true, home;
-        private long wakeStart, unlockStart;
-        private final BroadcastReceiver receiver = new BroadcastReceiver() {
-            @Override public void onReceive(Context context, Intent intent) {
-                String action=intent.getAction();
-                if (Intent.ACTION_SCREEN_OFF.equals(action)) { needsWake=true; home=false; unlockStart=0; }
-                else if (Intent.ACTION_SCREEN_ON.equals(action)) { needsWake=true; if (visible) beginWake(); }
-                else if (Intent.ACTION_USER_PRESENT.equals(action)) { home=true; unlockStart=SystemClock.uptimeMillis(); schedule(); }
-            }
-        };
-        @Override public void onCreate(SurfaceHolder holder) {
-            super.onCreate(holder);
-            IntentFilter filter=new IntentFilter(); filter.addAction(Intent.ACTION_SCREEN_ON); filter.addAction(Intent.ACTION_SCREEN_OFF); filter.addAction(Intent.ACTION_USER_PRESENT);
-            if (android.os.Build.VERSION.SDK_INT >= 33) registerReceiver(receiver,filter,Context.RECEIVER_NOT_EXPORTED); else registerReceiver(receiver,filter);
-            registered=true;
-        }
-        @Override public void onVisibilityChanged(boolean v) {
-            visible=v;
-            if (v) {
-                if (needsWake || wakeStart==0) beginWake();
-                else if (!keyguard.isKeyguardLocked() && !home) {home=true;unlockStart=SystemClock.uptimeMillis();}
-                schedule();
-            } else handler.removeCallbacks(drawTask);
-        }
-        private void beginWake() { wakeStart=SystemClock.uptimeMillis(); needsWake=false; home=!keyguard.isKeyguardLocked(); unlockStart=0; schedule(); }
-        private void schedule() { handler.removeCallbacks(drawTask); if(visible) handler.post(drawTask); }
-        @Override public void onSurfaceChanged(SurfaceHolder holder,int format,int width,int height) { super.onSurfaceChanged(holder,format,width,height); schedule(); }
-        @Override public void onDestroy() { handler.removeCallbacks(drawTask); if(registered) unregisterReceiver(receiver); super.onDestroy(); }
-        private float clamp(float x) {return Math.max(0f,Math.min(1f,x));}
-        private int mix(int a,int b,float t) {return (int)(a+(b-a)*t);}
-        private void draw() {
-            if(!visible) return;
-            Canvas c=null; SurfaceHolder holder=getSurfaceHolder();
-            try {
-                c=holder.lockCanvas(); if(c==null) return;
-                long now=SystemClock.uptimeMillis(); float w=c.getWidth(),h=c.getHeight();
-                float wake=clamp((now-wakeStart)/1400f);
-                float change=home ? (unlockStart==0?1f:clamp((now-unlockStart)/1200f)) : 0f;
-                c.drawColor(Color.rgb(mix(22,4,change),mix(9,24,change),mix(19,53,change)));
-                float x=w*.5f,y=h*.48f,r=Math.min(w,h)*(.22f+.10f*wake);
-                int glow=Color.rgb(mix(255,48,change),mix(153,158,change),mix(29,255,change));
-                paint.setShader(new RadialGradient(x,y,r*2.2f,new int[]{glow,Color.argb(90,Color.red(glow),Color.green(glow),Color.blue(glow)),Color.TRANSPARENT},null,Shader.TileMode.CLAMP)); c.drawCircle(x,y,r*2.2f,paint);paint.setShader(null);
-                paint.setColor(Color.argb(220,255,248,220)); c.drawCircle(x,y,r*.25f,paint);
-                paint.setColor(Color.argb(190,255,235,170));paint.setStrokeWidth(Math.max(2,w*.003f));
-                c.save();c.rotate((now-wakeStart)*.012f,x,y);
-                for(int i=0;i<28;i++){double angle=Math.PI*2*i/28;float inner=r*(.45f+.20f*wake),outer=r*(.6f+.6f*wake);c.drawLine(x+(float)Math.cos(angle)*inner,y+(float)Math.sin(angle)*inner,x+(float)Math.cos(angle)*outer,y+(float)Math.sin(angle)*outer,paint);}c.restore();
-                paint.setTextAlign(Paint.Align.CENTER);paint.setTextSize(w*.038f);paint.setColor(Color.WHITE); c.drawText(home?"HOME TRANSITION":"LOCK SCREEN WAKE",w*.5f,h*.78f,paint);
-            } catch (IllegalArgumentException ignored) {
-            } finally { if(c!=null) holder.unlockCanvasAndPost(c); if(visible) handler.postDelayed(drawTask,33); }
-        }
+    @Override public Engine onCreateEngine(){return new VideoEngine();}
+    final class VideoEngine extends Engine {
+        private final Handler handler=new Handler(Looper.getMainLooper());
+        private final SharedPreferences prefs=getSharedPreferences(MainActivity.PREFS,MODE_PRIVATE);
+        private final KeyguardManager keyguard=(KeyguardManager)getSystemService(KEYGUARD_SERVICE);
+        private MediaPlayer player; private boolean visible,surfaceReady,needsWake=true,registered,destroyed,playingWake=false;
+        private int generation=0;private long lastWake=0;
+        private final BroadcastReceiver events=new BroadcastReceiver(){@Override public void onReceive(Context c,Intent i){String a=i.getAction();
+            if(Intent.ACTION_SCREEN_OFF.equals(a)){needsWake=true;stopPlayer();}
+            else if(Intent.ACTION_SCREEN_ON.equals(a)){needsWake=true;handler.postDelayed(()->maybeWake(),100);}
+            else if(Intent.ACTION_USER_PRESENT.equals(a)){needsWake=false;playVideo(MainActivity.UNLOCK,false);}
+        }};
+        private final SharedPreferences.OnSharedPreferenceChangeListener changes=(p,k)->{if(visible&&surfaceReady){needsWake=true;maybeWake();}};
+        @Override public void onCreate(SurfaceHolder holder){super.onCreate(holder);IntentFilter f=new IntentFilter();f.addAction(Intent.ACTION_SCREEN_OFF);f.addAction(Intent.ACTION_SCREEN_ON);f.addAction(Intent.ACTION_USER_PRESENT);if(Build.VERSION.SDK_INT>=33)registerReceiver(events,f,Context.RECEIVER_NOT_EXPORTED);else registerReceiver(events,f);registered=true;prefs.registerOnSharedPreferenceChangeListener(changes);}
+        @Override public void onSurfaceCreated(SurfaceHolder h){super.onSurfaceCreated(h);surfaceReady=true;if(visible)maybeWake();}
+        @Override public void onSurfaceDestroyed(SurfaceHolder h){surfaceReady=false;stopPlayer();super.onSurfaceDestroyed(h);}
+        @Override public void onVisibilityChanged(boolean v){visible=v;if(v){if(needsWake)maybeWake();else if(player==null)playVideo(keyguard.isKeyguardLocked()?MainActivity.WAKE:MainActivity.UNLOCK,false);else try{player.start();}catch(IllegalStateException ignored){}}else{if(player!=null)try{if(player.isPlaying())player.pause();}catch(IllegalStateException ignored){}}}
+        private void maybeWake(){if(!visible||!surfaceReady||destroyed)return;if(!needsWake&&SystemClock.uptimeMillis()-lastWake<600)return;needsWake=false;lastWake=SystemClock.uptimeMillis();if(keyguard.isKeyguardLocked())playVideo(MainActivity.WAKE,true);else playVideo(MainActivity.UNLOCK,false);}
+        private void playVideo(String key,boolean isWake){if(!visible||!surfaceReady||destroyed)return;String value=prefs.getString(key,null);if(value==null)value=prefs.getString(MainActivity.WAKE,null);stopPlayer();if(value==null){drawEmpty();return;} final int token=++generation;playingWake=isWake;MediaPlayer p=new MediaPlayer();player=p;
+            try{p.setDataSource(TestWallpaper.this,Uri.parse(value));p.setSurface(getSurfaceHolder().getSurface());p.setLooping(false);p.setVolume(0f,0f);p.setOnPreparedListener(mp->{if(token!=generation||!visible||!surfaceReady){if(token==generation)stopPlayer();return;}try{mp.setVideoScalingMode(MediaPlayer.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING);mp.start();}catch(IllegalStateException ignored){}});p.setOnErrorListener((mp,what,extra)->{if(token==generation){stopPlayer();drawEmpty();}return true;});p.prepareAsync();}catch(IOException|SecurityException|IllegalArgumentException|IllegalStateException e){stopPlayer();drawEmpty();}}
+        private void drawEmpty(){if(!surfaceReady)return;Canvas c=null;try{c=getSurfaceHolder().lockCanvas();if(c!=null)c.drawColor(Color.rgb(12,16,28));}catch(Exception ignored){}finally{if(c!=null)try{getSurfaceHolder().unlockCanvasAndPost(c);}catch(Exception ignored){}}}
+        private void stopPlayer(){generation++;if(player!=null){try{player.reset();player.release();}catch(Exception ignored){}player=null;}}
+        @Override public void onDestroy(){destroyed=true;handler.removeCallbacksAndMessages(null);prefs.unregisterOnSharedPreferenceChangeListener(changes);if(registered)unregisterReceiver(events);stopPlayer();super.onDestroy();}
     }
 }
